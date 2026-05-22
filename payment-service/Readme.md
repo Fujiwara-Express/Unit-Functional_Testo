@@ -176,3 +176,75 @@ POST /payments/callback
 - Idempotent: jika `external_ref` sudah pernah diproses, return 200 tanpa update ulang
 
 ---
+
+#### Running Tests
+
+##### Unit Tests
+
+Unit tests live in the `service/` package and use mocks — no external dependencies required.
+
+```bash
+go test ./service/...
+```
+
+Run with verbose output:
+
+```bash
+go test -v ./service/...
+```
+
+Run a specific test by name:
+
+```bash
+go test -v ./service/... -run TestCharge
+```
+
+---
+
+##### Functional Tests
+
+Functional tests live in the `functional/` package and require a running PostgreSQL instance. They use the `functional` build tag and are excluded from normal `go test` runs.
+
+**1. Initialize the database**
+
+```bash
+psql -U postgres -f database.sql
+```
+
+**2. Set environment variables**
+
+| Variable | Default |
+|---|---|
+| `TEST_DB_HOST` | `localhost` |
+| `TEST_DB_PORT` | `5432` |
+| `TEST_DB_USER` | `postgres` |
+| `TEST_DB_PASSWORD` | *(empty)* |
+| `TEST_DB_NAME` | `payment_test` |
+
+**3. Run functional tests**
+
+```bash
+TEST_DB_HOST=localhost \
+TEST_DB_USER=postgres \
+TEST_DB_PASSWORD=yourpassword \
+TEST_DB_NAME=payment_test \
+go test -v -tags functional ./functional/...
+```
+
+On Windows (cmd):
+
+```cmd
+set TEST_DB_HOST=localhost
+set TEST_DB_USER=postgres
+set TEST_DB_PASSWORD=yourpassword
+set TEST_DB_NAME=payment_test
+go test -v -tags functional ./functional/...
+```
+
+---
+
+##### Run All Tests
+
+```bash
+go test ./service/... && go test -v -tags functional ./functional/...
+```

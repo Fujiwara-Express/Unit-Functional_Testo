@@ -230,3 +230,85 @@ PATCH /delivery/couriers/{courier_id}
   "status": "UPDATED"
 }
 ```
+
+---
+
+#### Running Tests
+
+##### Unit Tests
+
+Unit tests live in `service/` and use mocks — no database required.
+
+```bash
+go test ./service/...
+```
+
+Verbose output:
+
+```bash
+go test -v ./service/...
+```
+
+---
+
+##### Functional Tests
+
+Functional tests live in `functional/` and require a running PostgreSQL instance. They use the `functional` build tag and will be skipped unless the tag is provided.
+
+**Prerequisites:**
+- PostgreSQL running with a `delivery_test` database
+- The `couriers` and `delivery_jobs` tables must exist
+
+**Environment Variables:**
+
+| Variable | Default |
+|---|---|
+| `TEST_DB_HOST` | `localhost` |
+| `TEST_DB_PORT` | `5432` |
+| `TEST_DB_USER` | `postgres` |
+| `TEST_DB_PASSWORD` | *(empty)* |
+| `TEST_DB_NAME` | `delivery_test` |
+
+**Run:**
+
+```bash
+go test -v -tags functional ./functional/...
+```
+
+With custom DB credentials:
+
+```bash
+TEST_DB_USER=postgres TEST_DB_PASSWORD=yourpassword go test -v -tags functional ./functional/...
+```
+
+On Windows (CMD):
+
+```cmd
+set TEST_DB_HOST=localhost
+set TEST_DB_PORT=5432
+set TEST_DB_USER=postgres
+set TEST_DB_PASSWORD=yourpassword
+set TEST_DB_NAME=delivery_test
+go test -v -tags functional ./functional/...
+```
+
+On Windows (PowerShell):
+
+```powershell
+Set-Item Env:TEST_DB_HOST "localhost"
+Set-Item Env:TEST_DB_PORT "5432"
+Set-Item Env:TEST_DB_USER "postgres"
+Set-Item Env:TEST_DB_PASSWORD "yourpassword"
+Set-Item Env:TEST_DB_NAME "delivery_test"
+go test -v -tags functional ./functional/...
+```
+
+---
+
+##### Run All Tests
+
+```bash
+go test -v -tags functional ./...
+```
+
+> Note: This requires the PostgreSQL database to be available for functional tests to pass.
