@@ -9,39 +9,57 @@ import (
 	"strings"
 )
 
-func main() {
-	// 1. Catat alamat ruangan masing-masing service
-	pricingURL, _ := url.Parse("http://localhost:8080")
-	warehouseURL, _ := url.Parse("http://localhost:8081")
+// Config holds the upstream URLs for each backend service.
+type Config struct {
+	PricingURL   string
+	WarehouseURL string
+}
 
-	// 2. Buat mesin "Kurir" (Proxy) untuk meneruskan request
+// NewGateway builds and returns an http.Handler that routes requests to the
+// correct upstream service based on the URL path prefix:
+//
+//   - /pricing/*   → pricingURL  (prefix stripped before forwarding)
+//   - /warehouse/* → warehouseURL (prefix stripped before forwarding)
+//   - anything else → 404
+//
+// Accepting *url.URL values (instead of raw strings) makes the function easy
+// to test: callers can point the upstreams at httptest.Server instances.
+func NewGateway(pricingURL, warehouseURL *url.URL) http.Handler {
 	pricingProxy := httputil.NewSingleHostReverseProxy(pricingURL)
 	warehouseProxy := httputil.NewSingleHostReverseProxy(warehouseURL)
 
-	// 3. Resepsionis (Handler) mulai bekerja
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-
-		// Jika orang datang menyebut kata "/pricing" -> Arahkan ke Service Pricing
-		if strings.HasPrefix(r.URL.Path, "/pricing") {
-			r.URL.Path = strings.Replace(r.URL.Path, "/pricing", "", 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/pricing"):
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/pricing")
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
 			pricingProxy.ServeHTTP(w, r)
-			return
-		}
 
-		// Jika orang datang menyebut kata "/warehouse" -> Arahkan ke Service Gudang
-		if strings.HasPrefix(r.URL.Path, "/warehouse") {
-			r.URL.Path = strings.Replace(r.URL.Path, "/warehouse", "", 1)
+		case strings.HasPrefix(r.URL.Path, "/warehouse"):
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/warehouse")
+			if r.URL.Path == "" {
+				r.URL.Path = "/"
+			}
 			warehouseProxy.ServeHTTP(w, r)
-			return
-		}
 
-		// Jika rute tidak dikenali
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("Alamat tidak ditemukan di API Gateway Fujiwara Express"))
+		default:
+			http.Error(w, "Alamat tidak ditemukan di API Gateway Fujiwara Express", http.StatusNotFound)
+		}
 	})
 
-	// 4. Nyalakan Resepsionis di Pintu Utama (Port 8000)
+	return mux
+}
+
+func main() {
+	pricingURL, _ := url.Parse("http://localhost:8080")
+	warehouseURL, _ := url.Parse("http://localhost:8081")
+
+	gw := NewGateway(pricingURL, warehouseURL)
+
 	port := ":8000"
 	fmt.Printf("🚪 API Gateway menyala di http://localhost%s\n", port)
-	log.Fatal(http.ListenAndServe(port, nil))
+	log.Fatal(http.ListenAndServe(port, gw))
 }

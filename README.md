@@ -17,9 +17,9 @@ This repo contains multiple independently runnable Go services. Each service has
 | `tracking-service` | ✅ scattered in `internal/` | ✅ `internal/handler/functional_test.go` | No DB needed (in-memory mock); integration tests need `INTEGRATION=true` |
 | `routing-service` | ✅ scattered in `internal/` | ✅ `scripts/functional_tests.sh` | Shell script against a live server |
 | `user-service` | ✅ scattered in `internal/` | ✅ `scripts/functional_test.sh` | Shell script against a live server |
-| `pricing-service` | ✅ `internal/service/` | ⚠️ `tests/functional/` | Functional test is a stub/placeholder |
-| `warehouse-service` | ❌ none | ❌ none | No tests found |
-| `api-gateway` | ❌ none | ❌ none | No tests found |
+| `pricing-service` | ✅ `internal/service/` | ✅ `tests/functional/` | In-memory (no DB); PostgreSQL with `-tags postgres` (Docker) |
+| `warehouse-service` | ✅ `internal/service/`, `internal/delivery/http/` | ✅ `functional/` | In-memory (no DB); PostgreSQL with `-tags postgres` (Docker) |
+| `api-gateway` | ✅ `gateway_test.go` | ✅ `gateway_functional_test.go` | No DB or Docker needed — real `httptest.Server` stubs |
 
 ---
 
@@ -583,19 +583,169 @@ go test ./internal/service/...
 
 ### Functional Tests
 
-> ⚠️ The functional test in `tests/functional/pricing_api_test.go` is a **placeholder/stub** — the router and database wiring are commented out. It will always fail. No runnable functional tests exist yet for this service.
+#### In-memory (no DB required)
+
+Functional tests in `tests/functional/pricing_api_test.go` wire the real `PricingHandler`, real `PricingService`, and the built-in `memoryRepository` together end-to-end — **no database or Docker required**. The memory repo has one hardcoded zone (`CGK→BDO/Z1`) and one rate (`Z1/REG`: 10 000/kg, max dims 100×100×100, max weight 50).
+
+**What's covered:**
+- Normal package — actual weight dominates, correct total price, all response fields present
+- Volumetric weight dominates — `(L×W×H)/6000 > actual weight`
+- Minimum weight applied — both actual and volumetric below `min_weight`
+- Oversize by length, width, height, and weight — each dimension independently triggers the 50 000 surcharge
+- Exactly at limits — no surcharge when package is exactly at max dimensions
+- Zone not found — unknown origin/destination returns HTTP 500
+- Invalid JSON body — returns HTTP 400
+- Wrong HTTP method (GET) — returns HTTP 405
+- Full lifecycle — normal, volumetric, and oversize cases in one table-driven test
+
+```bash
+cd pricing-service
+go test -v ./tests/functional/...
+```
+
+---
+
+#### PostgreSQL (requires Docker)
+
+`tests/functional/postgres_functional_test.go` uses **Testcontainers** to spin up a `postgres:15-alpine` container and exercises the real `PostgresRepository` end-to-end. Uses the `postgres` build tag.
+
+**Prerequisites:** Docker running — no environment variables needed.
+
+**What's covered:**
+- Normal package, volumetric dominates, oversize by length and weight — same scenarios as in-memory but against a real DB
+- Different zone (`CGK→SBY/Z2`) — verifies correct rate lookup per zone
+- YES service type — tighter limits (MaxLength 80) and higher rate (20 000/kg)
+- YES oversize — 90 cm package exceeds YES MaxLength of 80
+- Zone not found and rate not found — HTTP 500 error paths
+- Full lifecycle — 5 scenarios in one table-driven test
+
+```bash
+cd pricing-service
+go test -v -tags postgres ./tests/functional/...
+```
+
+> The first run may take longer while Docker pulls the `postgres:15-alpine` image.
 
 ---
 
 ## Warehouse Service
 
-> ❌ No tests found. The service has no `*_test.go` files.
+### Unit Tests
+
+Unit tests are split across the service and handler layers and use `go.uber.org/mock` — no database required.
+
+**What's covered:**
+- `internal/service/warehouse_service_test.go` — ReceiveItem (new item, quantity merge, location update, save error), DispatchItem (valid, exact stock, out-of-stock, not found, save error), CheckStock (found, not found, repository error)
+- `internal/delivery/http/warehouse_handler_test.go` — all three HTTP handlers: valid requests, invalid JSON, wrong HTTP method, service errors, domain errors (ErrOutOfStock, ErrItemNotFound)
+
+```bash
+cd warehouse-service
+go test -v ./internal/service/... ./internal/delivery/...
+```
+
+---
+
+### Functional Tests
+
+#### In-memory (no DB required)
+
+Functional tests in `functional/functional_test.go` wire the real handler, real service, and the built-in in-memory repository together end-to-end — **no database or Docker required**.
+
+**What's covered:**
+- `POST /receive` — new item, stock accumulation, location overwrite, invalid JSON
+- `POST /dispatch` — valid dispatch, exact stock, out-of-stock (stock unchanged), item not found, invalid JSON
+- `GET /check-stock` — found (correct JSON fields), not found, missing `id` param
+- Full lifecycle: receive → check → receive more → dispatch → check → failed dispatch → check
+- Multiple independent items tracked separately
+
+```bash
+cd warehouse-service
+go test -v ./functional/...
+```
+
+---
+
+#### PostgreSQL (requires Docker)
+
+`functional/postgres_functional_test.go` uses **Testcontainers** to spin up a `postgres:15-alpine` container and exercises the real `PostgresRepository` end-to-end. Uses the `postgres` build tag.
+
+**Prerequisites:** Docker running — no environment variables needed.
+
+**What's covered:**
+- `POST /receive` persists row in DB, upsert accumulates quantity
+- `POST /dispatch` updates row in DB, out-of-stock leaves row unchanged
+- `GET /check-stock` returns data from DB, not-found returns 404
+- Full lifecycle against PostgreSQL
+
+```bash
+cd warehouse-service
+go test -v -tags postgres ./functional/...
+```
+
+> The first run may take longer while Docker pulls the `postgres:15-alpine` image.
 
 ---
 
 ## API Gateway
 
-> ❌ No tests found. The gateway has no `*_test.go` files.
+The routing logic was extracted from `main()` into a testable `NewGateway(pricingURL, warehouseURL *url.URL) http.Handler` function. `main()` remains a thin entry point that parses the upstream URLs and calls `NewGateway`.
+
+### Unit Tests
+
+Unit tests live in `gateway_test.go` and use `httptest.Server` stub backends — no real services required.
+
+**What's covered:**
+- `/pricing/*` prefix routing — path stripping, POST, deep paths, `/pricing` root, isolation from warehouse backend
+- `/warehouse/*` prefix routing — receive, check-stock (query string preserved), dispatch, `/warehouse` root, isolation from pricing backend
+- Unknown paths — 404 for unrecognised routes, bare `/`, response body message
+- Lookalike prefix behaviour — documents that `/pricingextra` matches `/pricing` (HasPrefix semantics)
+- Upstream error propagation — 500 and 503 from backends passed through; unreachable backend returns 502
+- Response passthrough — body and status code forwarded unchanged
+- `NewGateway` independence — two instances with different backends don't interfere
+
+```bash
+cd api-gateway
+go test -v -run TestRouting ./...
+go test -v -run TestUpstream ./...
+go test -v -run TestResponse ./...
+go test -v -run TestNewGateway ./...
+```
+
+Or run all at once:
+
+```bash
+cd api-gateway
+go test -v ./...
+```
+
+---
+
+### Functional Tests
+
+Functional tests live in `gateway_functional_test.go` and spin up **three real `httptest.Server` instances** — one for the gateway, one for each upstream backend. No mocks, no Docker, no external dependencies.
+
+**What's covered:**
+- `POST /pricing/calculate-price` — full round-trip, response body and headers passed through
+- `POST /pricing/calculate-price` (POST method) — method forwarded correctly
+- `POST /warehouse/receive` — request body forwarded intact, 201 returned
+- `GET /warehouse/check-stock?id=BRG-001` — query string preserved, JSON response decoded
+- `POST /warehouse/dispatch` — path stripped correctly
+- Unknown routes — 404 with message body, backends not called
+- Upstream 500 and 400 propagated to client
+- Unreachable backend returns 502
+- Full lifecycle — price calculation → stock receive → stock check → unknown route
+
+```bash
+cd api-gateway
+go test -v -run TestFunctional ./...
+```
+
+Or run everything together:
+
+```bash
+cd api-gateway
+go test -v ./...
+```
 
 ---
 
@@ -658,4 +808,22 @@ cd user-service && BASE_URL=http://localhost:8080 bash scripts/functional_test.s
 
 # Pricing — unit only
 cd pricing-service && go test ./internal/service/...
+
+# Pricing — functional (no DB needed)
+cd pricing-service && go test -v ./tests/functional/...
+
+# Pricing — functional with PostgreSQL (requires Docker)
+cd pricing-service && go test -v -tags postgres ./tests/functional/...
+
+# API Gateway — unit + functional (no DB or Docker needed)
+cd api-gateway && go test -v ./...
+
+# Warehouse — unit only
+cd warehouse-service && go test ./internal/service/... ./internal/delivery/...
+
+# Warehouse — functional (no DB needed)
+cd warehouse-service && go test -v ./functional/...
+
+# Warehouse — functional with PostgreSQL (requires Docker)
+cd warehouse-service && go test -v -tags postgres ./functional/...
 ```
