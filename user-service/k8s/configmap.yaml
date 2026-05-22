@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-config
+  namespace: user-service
+  labels:
+    app: user-service
+data:
+  PORT: "8080"
+  # DB_DSN is intentionally omitted here — it contains credentials and lives in the Secret.
+  MIGRATIONS_DIR: "/app/migrations"

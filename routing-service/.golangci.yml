@@ -1,0 +1,46 @@
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - govet        # go vet equivalent
+    - staticcheck  # comprehensive static analysis
+    - errcheck     # unchecked errors
+    - gosimple     # simplification suggestions
+    - ineffassign  # ineffectual assignments
+    - unused       # unused code
+    - gofmt        # formatting
+    - goimports    # import ordering
+    - misspell     # spelling mistakes in comments/strings
+    - godot        # comment punctuation
+    - noctx        # http requests without context
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # not critical for this service
+
+  staticcheck:
+    checks: ["all"]
+
+  gofmt:
+    simplify: true
+
+  goimports:
+    local-prefixes: routing-service
+
+issues:
+  exclude-rules:
+    # Test files: allow longer functions and unused params
+    - path: "_test\\.go"
+      linters:
+        - errcheck
+        - godot
+    # Generated or vendor code
+    - path: "vendor/"
+      linters:
+        - all
+  max-issues-per-linter: 50
+  max-same-issues: 10

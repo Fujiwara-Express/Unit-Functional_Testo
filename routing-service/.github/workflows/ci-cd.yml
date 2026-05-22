@@ -1,0 +1,398 @@
+name: CI/CD Pipeline — Routing Service
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: routing-service
+  # Override these via GitHub repository secrets / variables
+  REGISTRY: ghcr.io
+  IMAGE_FULL: ghcr.io/${{ github.repository_owner }}/routing-service
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 2 — Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  unit-test:
+    name: "2 · Unit Tests (go test)"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: routing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply DB migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d routing -f migrations/001_init.sql
+
+      - name: Run unit tests with coverage
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/routing?sslmode=disable
+          REDIS_ADDR: localhost:6379
+          DELIVERY_SERVICE_URL: http://localhost:8081
+        run: |
+          go test -v -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Print coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 3 — Lint / Vet
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: "3 · Lint / Vet (go vet + staticcheck)"
+    runs-on: ubuntu-latest
+    needs: unit-test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59.1
+          args: --timeout=5m
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 4 — Build Docker Image (local / CI)
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-image:
+    name: "4 · Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: lint
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_FULL }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push yet — functional tests first)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image as tar for next jobs
+        run: |
+          docker save ${{ env.IMAGE_FULL }}:latest -o /tmp/routing-service.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/routing-service.tar
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 5 — Functional Tests (app running locally in CI)
+  # ─────────────────────────────────────────────────────────────────────────────
+  functional-test:
+    name: "5 · Functional Tests (local/staging)"
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: routing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/routing-service.tar
+
+      - name: Apply DB migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d routing -f migrations/001_init.sql
+
+      - name: Start routing-service container
+        run: |
+          docker run -d \
+            --name routing-service \
+            --network host \
+            -e DATABASE_URL="postgres://postgres:postgres@localhost:5432/routing?sslmode=disable" \
+            -e REDIS_ADDR="localhost:6379" \
+            -e DELIVERY_SERVICE_URL="http://localhost:8081" \
+            -e PORT="8080" \
+            ${{ env.IMAGE_FULL }}:latest
+
+      - name: Wait for service to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/routing/nodes > /dev/null 2>&1; then
+              echo "Service is up after ${i}s"
+              exit 0
+            fi
+            echo "Waiting... (${i}/30)"
+            sleep 1
+          done
+          echo "Service did not start in time"
+          docker logs routing-service
+          exit 1
+
+      - name: Run functional tests
+        run: bash scripts/functional_tests.sh
+
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs routing-service
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 6 — Push Image to Registry
+  # ─────────────────────────────────────────────────────────────────────────────
+  push-image:
+    name: "6 · Push Image to Registry"
+    runs-on: ubuntu-latest
+    needs: functional-test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/routing-service.tar
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (re-tag for push)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_FULL }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 7 — Deploy to Kubernetes
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: "7 · Deploy to Kubernetes"
+    runs-on: ubuntu-latest
+    needs: push-image
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=sha-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Update Deployment image tag
+        run: |
+          kubectl set image deployment/routing-service \
+            routing-service=${{ env.IMAGE_FULL }}:${{ steps.tag.outputs.tag }} \
+            -n routing
+
+      - name: Apply Kubernetes manifests (idempotent)
+        run: |
+          kubectl apply -f k8s/ -n routing
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/routing-service -n routing --timeout=120s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 8 — Verify Deployment
+  # ─────────────────────────────────────────────────────────────────────────────
+  verify:
+    name: "8 · Verify Deployment"
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Check pod status
+        run: |
+          kubectl get pods -n routing -l app=routing-service
+          kubectl wait --for=condition=Ready pod \
+            -l app=routing-service \
+            -n routing \
+            --timeout=120s
+
+      - name: Smoke test via kubectl port-forward
+        run: |
+          kubectl port-forward svc/routing-service 8080:8080 -n routing &
+          PF_PID=$!
+          sleep 3
+
+          echo "=== GET /routing/nodes ==="
+          curl -sf http://localhost:8080/routing/nodes | python3 -m json.tool
+
+          echo "=== GET /routing/edges ==="
+          curl -sf http://localhost:8080/routing/edges | python3 -m json.tool
+
+          kill $PF_PID || true
+
+      - name: Print deployment summary
+        run: |
+          echo "### Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE_FULL }}:sha-$(git rev-parse --short HEAD)\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | \`routing\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          kubectl get deployment routing-service -n routing \
+            -o jsonpath='| Replicas | `{.status.readyReplicas}/{.spec.replicas}` |' \
+            >> $GITHUB_STEP_SUMMARY

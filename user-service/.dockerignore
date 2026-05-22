@@ -1,0 +1,6 @@
+.git
+.kiro
+*.exe
+*.test
+*.out
+vendor/

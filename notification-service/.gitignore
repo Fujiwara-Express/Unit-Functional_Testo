@@ -1,0 +1,12 @@
+# Kiro IDE files
+../.kiro/
+
+# Coverage files
+coverage.out
+coverage
+cov_*
+*.coverprofile
+
+# Build output
+*.exe
+*.test
